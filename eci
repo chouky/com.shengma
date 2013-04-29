@@ -1,0 +1,1345 @@
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Data;
+using System.Diagnostics;
+using System.EnterpriseServices;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.Serialization;
+using System.ServiceModel;
+using System.ServiceModel.Configuration;
+using System.Text;
+using System.Threading;
+using System.Xml;
+using Percana.Eclipse.ClassFactory;
+using Percana.Eclipse.Common;
+using Percana.Eclipse.Common.Constants;
+using Percana.Eclipse.Common.Interfaces;
+using Percana.Eclipse.DataAccess;
+using Percana.Eclipse.Error;
+using Percana.Eclipse.Resolver.Server;
+using Percana.Eclipse.Server.Licensing;
+using Percana.Eclipse.Transport.ECI;
+
+#region Notes
+
+//***************************************************************************************'
+//*                  Copyright Percana Technologies                                     *'
+//***************************************************************************************'
+
+//************************************************************************************
+// Eclipse Common Interface component
+// Copyright Percana Technologies 2002
+//
+// Description :
+//   This component provides:
+//
+//       Client Load Balancing (CLB)
+//       Server Load Balancing (SLB)
+//       A single interface for all transactions
+//       WebService API
+//       XML Logging facilities
+//       Encryption security services
+//       Licensing
+//
+// Notes:
+//
+//   The EclipseCommonInterface utilises XML Lookup files which allows it to map transactions to server objects.
+//   If this object is in MTS, it uses the shared property manager to store this lookup data.
+//
+//   The ELB registry settings are used to determine if the component is to run as a:
+//       client load balancer
+//       server load balancer
+//       WebService client
+//
+// Author:   PKall
+//
+// Version:  3.2 14/02/2003
+//
+//************************************************************************************
+#endregion
+
+namespace Percana.Eclipse.Transport
+{
+    //InstanceContentMode.Single crash the VS2010
+    //[ServiceBehavior (InstanceContextMode = InstanceContextMode.Single, ConcurrencyMode = ConcurrencyMode.Multiple)]
+    [ServiceBehavior(InstanceContextMode = InstanceContextMode.PerCall,
+        ConcurrencyMode = ConcurrencyMode.Multiple, MaxItemsInObjectGraph = Int32.MaxValue)]
+    public class EclipseCommonInterface : EclipseLoadBalancer, ISvrECI
+    {
+        #region Fields
+
+        private Dictionary<string, LookupData> m_LookupData;
+        private readonly ECIUtility.enmXMLLogSetting m_enmXMLLogSetting;
+        private readonly string _nonLoggingTransactions;
+
+        #endregion Fields
+
+        #region Constructors
+
+        public EclipseCommonInterface()
+            : base(false)
+        {
+            m_enmXMLLogSetting = (ECIUtility.enmXMLLogSetting)ECIConfigSettings.XMLLogging;
+            _nonLoggingTransactions = ECIConfigSettings.NonLoggingTransactions;
+            if (m_enmXMLLogSetting != ECIUtility.enmXMLLogSetting.enmXMLLoggingNone) SetupConfigSettings(bDBSettings: true);
+        }
+
+        #endregion Constructors
+
+        #region Enumerations
+
+        enum fieldNames
+        {
+            header = 1,
+            component = 2,
+            Class = 3,
+            Method = 4,
+            Workflow = 5
+        }
+
+        #endregion Enumerations
+
+        #region Shared property manager functions
+
+        private static SharedProperty GetSharedProperty(string sPropertyName,
+            out bool bGroupExists, out bool bPropExists, ref SharedPropertyGroup spmGroup)
+        {
+            bPropExists = false;
+            bGroupExists = false;
+            SharedProperty spmProp = null;
+
+            if (spmGroup == null)
+            {
+                SharedPropertyGroupManager spmMgr = new SharedPropertyGroupManager();
+                PropertyLockMode lockMode = PropertyLockMode.SetGet;
+                PropertyReleaseMode releaseMode = PropertyReleaseMode.Process;
+                spmGroup = spmMgr.CreatePropertyGroup(sPropertyName, ref lockMode,
+                    ref releaseMode, out bGroupExists);
+            }
+            else
+            {
+                bGroupExists = true;
+            }
+            //spmGroup may be set to NULL in the "if (spmGroup == null)" Block above.So create object blow if spmGroup is NULL 
+            if (spmGroup != null)
+            {
+                spmProp = spmGroup.CreateProperty(sPropertyName, out bPropExists);
+            }
+            return spmProp;
+        }
+
+        private static SharedProperty GetSharedProperty(string sPropertyName)
+        {
+            bool bGroupExists;
+            bool bPropExists;
+            SharedPropertyGroup spmGroup = null;
+            return GetSharedProperty(sPropertyName, out bGroupExists, out bPropExists,
+                ref spmGroup);
+        }
+
+        #endregion
+
+        #region Methods
+
+        /// <summary>
+        /// Override for the base SetELBServers(ref spmGroup)
+        /// </summary>
+        public override void SetELBServers()
+        {
+            SharedPropertyGroup spmGroup = null;
+            SetELBServers(ref spmGroup);
+        }
+
+        /// <summary>
+        /// Reads lists of available WCF Clients from .config file and enables each for use with load balancing.
+        /// For server mode, this is stored in the shared property manager for the recording and use of stats accross 
+        /// various instances of the EclipseCommonInterface.
+        /// </summary>
+        /// <param name="spmGroup"></param>
+        public string SetELBServers(ref  SharedPropertyGroup spmGroup)
+        {
+            SharedProperty spmProp;
+            List<ELBSharedStats> eblStats = new List<ELBSharedStats>();
+            string sServerNamesCSV = string.Empty;
+
+            Trace("SetELBServers with SharedPropertyGroup", "Start");
+            ClientSection section = null;
+            try
+            {
+                section = ConfigurationManager.GetSection("system.serviceModel/client") as ClientSection;
+            }
+            catch
+            {
+                System.Configuration.Configuration config =
+                   ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
+                ConfigurationSectionGroup grop = config.GetSectionGroup("system.serviceModel");
+                if (grop != null)
+                {
+                    section = grop.Sections["client"] as ClientSection;
+                }
+            }
+
+            if (section == null)
+            {
+                throw new ConfigurationErrorsException("The <system.serviceModel> section is not defined in your .config file!");
+            }
+
+            int i = 0;
+            ELBSharedStats lELBStats;
+            string sServerNames;
+            bool bGroupExists;
+            bool bPropExists;
+            foreach (ChannelEndpointElement endPoint in section.Endpoints)
+            {
+
+                if (!bLocal)
+                {
+                    sServerNames = endPoint.Name;
+                    sServerNamesCSV += sServerNames + ";";
+                    bGroupExists = false;
+                    bPropExists = false;
+                    spmProp = GetSharedProperty(sServerNames, out bGroupExists,
+                        out bPropExists, ref spmGroup);
+
+                    if ((bPropExists == false) ||
+                        (bGroupExists == false) || spmProp.Value.ToString().Equals("0") ||
+                        ((Convert.ToString(spmProp.Value)).Length == 0))
+                    {
+                        lELBStats = CreateNewServerStat(endPoint, ref i);
+                        spmProp.Value = lELBStats;
+                    }
+                    else
+                    {
+                        lELBStats = (ELBSharedStats)spmProp.Value;
+                    }
+                }
+                else
+                {
+                    lELBStats = CreateNewServerStat(endPoint, ref i);
+                }
+                eblStats.Add(lELBStats);
+            }
+
+            elbStatistics.SetServers(eblStats);
+            return sServerNamesCSV;
+        }
+
+        /// <summary>
+        /// Reads lists of available WCF Clients from Shared Property Manager and enables each for use with load balancing.
+        /// Server mode only.
+        /// </summary>
+        /// <param name="sServerList"></param>
+        /// <param name="spmGroup"></param>
+        public void SetELBServers(string sServerList, ref  SharedPropertyGroup spmGroup)
+        {
+            SharedProperty spmProp;
+            Trace("SetELBServers from SharedPropertyGroup", "Start");
+
+            string[] sServerListArray = sServerList.Split(';');
+            int iCount = sServerListArray.Length - 1;
+            elbStatistics.SetServers(new List<ELBSharedStats>(new ELBSharedStats[iCount]));
+
+            for (int i = 0; i < iCount; ++i)
+            {
+                bool bPropExists;
+                bool bGroupExists;
+                spmProp = GetSharedProperty(sServerListArray[i], out bGroupExists,
+                    out bPropExists, ref spmGroup);
+                //elbStatistics[i] = (ELBSharedStats)spmProp.Value;
+                elbStatistics[i] = spmProp.Value as ELBSharedStats;
+            }
+        }
+
+        protected virtual string CreateDatabaseDSN(string sSource, string sUserId,
+            string sPassword, string sDatabase)
+        {
+            return ("Data Source=" + sSource + ";Initial Catalog=" + sDatabase +
+                ";User Id=" + sUserId + ";Password=" + sPassword).Trim();
+        }
+
+        /// <summary>
+        /// Server mode only.  Retrieves the specified data from the Shared Property Manager.
+        //  If no data is found, an attempt is made to load it from the relevant source.
+        /// Data is either server and load balancing stats or lookups.
+        /// </summary>
+        /// <param name="sGroupName"></param>
+        /// <param name="szProperty1"></param>
+        /// <param name="sGUID"></param>
+        /// <returns></returns>
+        protected override Dictionary<string, LookupData> GetGlobalData(
+            ECIUtility.enmECIGroupNames sGroupName, string szProperty1, string sGUID)
+        {
+            Dictionary<string, LookupData> result = null;
+            SharedPropertyGroup spmGroup = null;
+            SharedProperty spmProp;
+
+            try
+            {
+                bool bGroupExists;
+                bool bPropExists;
+                spmProp = GetSharedProperty(szProperty1.Trim(), out bGroupExists,
+                    out bPropExists, ref spmGroup);
+
+                if (!bPropExists)
+                {
+                    switch (sGroupName)
+                    {
+                        case ECIUtility.enmECIGroupNames.enmELBServers:
+                            spmProp.Value = SetELBServers(ref spmGroup);
+                            break;
+                        case ECIUtility.enmECIGroupNames.enmXMLLookup:
+                            LoadXMLLookupData(szProperty1, sGUID);
+                            result = m_LookupData;
+                            spmProp.Value = result;
+                            break;
+                    }
+                }
+                else
+                {
+                    switch (sGroupName)
+                    {
+                        case ECIUtility.enmECIGroupNames.enmXMLLookup:
+                            result = spmProp.Value as Dictionary<string, LookupData>;
+                            if (!(result is Dictionary<string, LookupData>))
+                            {
+                                LoadXMLLookupData(szProperty1, sGUID);
+                                result = m_LookupData;
+                            }
+                            else
+                            {
+                                Trace("GetGlobalData", "Retrieving lookup from SPM: " +
+                                    szProperty1);
+                                m_LookupData = result;
+                            }
+                            break;
+                        case ECIUtility.enmECIGroupNames.enmELBServers:
+                            SetELBServers(spmProp.Value.ToString(), ref spmGroup);
+                            spmProp = spmGroup.CreateProperty(cValidationFrequency,
+                                out bPropExists);
+                            if ((bPropExists))
+                            {
+                                iValidationFrequency = (int)spmProp.Value;
+                            }
+                            break;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                if (e.GetType() != typeof(EclipseException))
+                {
+                    throw new EclipseCommonInterfaceException("GetGlobalData", e);
+                }
+                else
+                    throw;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Record the response time of the last server called
+        /// </summary>
+        /// <param name="lResponse"></param>
+        protected override void RecordELBServerResponse(long lResponse)
+        {
+            ELBSharedStats lastServer = elbStatistics.LastServerUsed;
+
+            lastServer.lTotalTime += lResponse;
+            lastServer.lLastResponseTime = lResponse;
+            elbStatistics.LastServerUsed.lTotalCalls++;
+            elbStatistics[lastServer.lIndex] = lastServer;
+
+            if (bLocal) return;
+            string sStats = lastServer.lTotalTime + "," +
+                            elbStatistics.LastServerUsed.lTotalCalls + "," +
+                            lastServer.lLastResponseTime;
+            Trace("RecordELBServerResponse", lastServer.sServerName + ": " +
+                                             sStats + " (total:calls:last)");
+            SetGlobalData(lastServer.sServerName, lastServer);
+        }
+
+        /// <summary>
+        /// Retreives the relevant component details from the XML Lookup files.
+        //               For example, the Category 'Premium' and the header 'PolicyPremHolidayData'
+        //               should return data such as:
+        //                    Component - SvrPremium
+        //                    Class     - cSvrPremHoliday
+        //                    Method    - SvrGetPolicyPremHolidayDataFromDatabase
+        /// </summary>
+        /// <param name="sXmlCategory"></param>
+        /// <param name="sXMLHeader"></param>
+        /// <param name="sGUID"></param>
+        /// <returns></returns>
+        private LookupData GetComponentDetailsFromXMLLookup(string sXmlCategory,
+            string sXMLHeader, string sGUID)
+        {
+            Trace("GetComponentDetailsFromXMLLookup", "sXMLCategory = " +
+                sXmlCategory + ", sXMLHeader = " + sXMLHeader);
+
+            try
+            {
+                string sKey = sXmlCategory + "-" + sXMLHeader;
+                ELBSharedStats lastServer = elbStatistics.LastServerUsed;
+
+                //Periodically check the license agreement.  The iValidationFrequency is taken from the license itself
+                if ((iValidationFrequency > 0) && (lastServer.lTotalCalls > 0))
+                {
+                    if (lastServer.lTotalCalls % iValidationFrequency == 0)
+                    {
+                        Trace("Verifying License agreement", lastServer.sServerName +
+                            " after call number " + lastServer.lTotalCalls);
+                        VerifiyLicenseAgreement(sGUID);
+                    }
+                }
+
+                Dictionary<string, LookupData> data;
+                if (bLocal)
+                {
+                    if ((m_LookupData == null) || (m_LookupData.ContainsKey(sKey) == false))
+                    {
+                        LoadXMLLookupData(sXmlCategory, sGUID);
+                    }
+                    data = m_LookupData;
+                }
+                else
+                {
+                    data = GetGlobalData(ECIUtility.enmECIGroupNames.enmXMLLookup,
+                        sXmlCategory, sGUID);
+                }
+
+                if (data != null)
+                {
+                    return data[sKey];
+                }
+            }
+            catch (Exception ex)
+            {
+                if (ex.GetType() != typeof(EclipseException))
+                {
+                    throw new EclipseCommonInterfaceException(
+                        "No XDF information found for " + sXmlCategory + " "
+                        + sXMLHeader, ex);
+                }
+                else
+                    throw;
+            }
+
+            return new LookupData();
+        }
+
+        /// <summary>
+        /// Loads the XML Lookup data from a the relevant file and stores the resulting data in a recordset
+        /// </summary>
+        /// <param name="sFileName"></param>
+        /// <param name="sGUID"></param>
+        private void LoadXMLLookupData(string sFileName, string sGUID)
+        {
+            try
+            {
+                VerifiyLicenseAgreement(sGUID);
+                //E.g  "D:\\Eclipse\\Generali International\\XMLLookups";
+                string sPath = ECIConfigSettings.XDFFiles;
+                sPath = (sPath + "\\").Replace("\\\\", "\\");
+
+                Trace("LoadXMLLookupData",
+                    string.Format("Starting load of {0}\\{1}.xdf", sPath, sFileName));
+
+                Dictionary<string, LookupData> dict = new Dictionary<string, LookupData>();
+
+                //PVM debug
+                //if (sFileName == "Actuarial")
+                //{
+                //    StreamReader tmp = new StreamReader(sPath + "\\" + sFileName + ".xdf");
+                //    Trace("LoadXMLLookupData", tmp.ReadToEnd());
+                //    tmp.Close();
+                //}
+
+                //PVM end of debug
+
+                using (StreamReader reader = new StreamReader(
+                    string.Format("{0}\\{1}.xdf", sPath, sFileName)))
+                {
+                    LookupData data;
+                    while (!reader.EndOfStream)
+                    {
+                        data = new LookupData();
+                        string[] sData = reader.ReadLine().Split(',');
+                        data.sXMLHeader = sData[(int)fieldNames.header];
+                        data.sComponent = sData[(int)fieldNames.component];
+                        data.sClass = sData[(int)fieldNames.Class];
+                        data.sMethod = sData[(int)fieldNames.Method];
+                        data.sWorkflowEnabled = (sData[(int)fieldNames.Workflow] ==
+                            Common.Constants.Workflow.XMLWorkflowConstants.gWorkflowEnabled);
+                        dict.Add(sFileName + "-" + sData[1], data);
+                    }
+                }
+
+                Trace("LoadXMLLookupData", "# Records = " + dict.Count);
+                if (bLocal)
+                {
+                    m_LookupData = dict;
+                }
+                else
+                {
+                    m_LookupData = dict;
+                    SetGlobalData(sFileName, m_LookupData);
+
+                    //Save the licensing validation frequency (i.e. the period at which the licensing is checked)
+                    if (iValidationFrequency > 0)
+                    {
+                        SetGlobalData(cValidationFrequency, iValidationFrequency);
+                    }
+                }
+            }
+            catch (Exception excep)
+            {
+                string sError = excep.Message;
+
+                Trace("LoadXMLLookupData", "ErrHandler-" + sError);
+                if (!(excep is EclipseException))
+                {
+                    throw new EclipseCommonInterfaceException("EclipseCommonInterface - LoadXMLLookupData " + sError, excep);
+                }
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Function to Log XML Transactions and requests
+        /// </summary>
+        /// <param name="sXmlRequest"></param>
+        /// <param name="sXmlReply"></param>
+        /// <param name="sErrorXML"></param>
+        /// <param name="sUserId"></param>
+        /// <param name="sRecordsetXML"></param>
+        /// <param name="sGUID"></param>
+        /// <param name="lResponseTime"></param>
+        /// <param name="sCategory"></param>
+        /// <param name="sType"></param>
+        private long LogXML(string sXmlRequest, string sXmlReply, string sErrorXML,
+            string sUserId, string sRecordsetXML, string sGUID, int lResponseTime,
+            string sCategory, string sType)
+        {
+            object o = null;
+
+            try
+            {
+                Configuration.DatabaseConfig xmlSettings =
+                    DBConfigSettings.databases[Configuration.DatabaseCfg.dbs.XMLLog];
+
+                //Create log DSN
+                string sXmlDSN = CreateDatabaseDSN(xmlSettings.DBSource,
+                    xmlSettings.DBUserID, xmlSettings.Password(
+                    SystemInfoClassFactory.EclipseSystemInfo.PreparePrivateKey(
+                    Encryption.sXMLLogKey)), xmlSettings.DBName);
+
+                DataAccessor cLogConnection = new DataAccessor(sXmlDSN);
+                string sDate = DateTime.Now.ConvertToEclipseDBDate();
+                IDbCommand sqlCommand = cLogConnection.CreateCommand();
+
+                //Build the SQL to insert the XML log entry
+                sqlCommand.CommandText = "INSERT INTO XL_XML_LOG VALUES ( @xl_create_date, @xl_last_updt_date, @xl_last_updt_time, @xl_last_updt_userid, @xl_record_status, @xl_guid, @xl_request, @xl_reply, @xl_replayed, @xl_recordsetxml, @xl_errorxml, @xl_responsetime, @xl_category, @xl_type)";
+                IDbDataParameter param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_create_date";
+                param.Value = sDate;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_last_updt_date";
+                param.Value = sDate;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_last_updt_time";
+                param.Value = DateTime.Now.ConvertToEclipseDBTime();
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_last_updt_userid";
+                param.Value = sUserId;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_record_status";
+                param.Value = PolicyConstants.gInForce;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_guid";
+                param.Value = ((String.CompareOrdinal(sGUID, "") > 0 && sGUID != "{INVALID-GUID-LOOKUP-ONLY}") ? sGUID : null) ??
+                              (object)DBNull.Value;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_request";
+                param.Value = sXmlRequest;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_reply";
+                param.Value = sXmlReply ?? "";
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_replayed";
+                param.Value = GeneralConstants.gNo;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_recordsetxml";
+                param.Value = sRecordsetXML;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_errorxml";
+                param.Value = sErrorXML;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_responsetime";
+                param.Value = lResponseTime;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_category";
+                param.Value = sCategory ?? (object)DBNull.Value;
+                sqlCommand.Parameters.Add(param);
+
+                param = sqlCommand.CreateParameter();
+                param.ParameterName = "@xl_type";
+                param.Value = sType ?? (object)DBNull.Value;
+                sqlCommand.Parameters.Add(param);
+
+                //Execute the SQL
+                cLogConnection.BeginTransaction();
+                try
+                {
+                    cLogConnection.ExecuteSQL(sqlCommand);
+
+                    if (TracingOn)
+                    {
+                        sqlCommand.CommandText = "SELECT @@IDENTITY";
+                        IDataReader tempReader = sqlCommand.ExecuteReader();
+                        if (tempReader.Read())
+                        {
+                            o = tempReader.GetValue(0);
+                        }
+                        tempReader.Close();
+                        Trace("LogXML", "XML Log Id = " + o);
+                    }
+                    cLogConnection.Commit();
+                    return Convert.ToInt64(o);
+                }
+                catch (Exception e)
+                {
+                    cLogConnection.Rollback(false);
+                    throw new EclipseException(enmEclipseErrorMessages.MSG_CANNOT_ADD_XML_LOG_ENTRY, "LogXML - ERROR " + e.Message);
+                }
+                finally
+                {
+                    try
+                    {
+                        cLogConnection.Dispose();
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+
+            catch (Exception e)
+            {
+                throw new EclipseException(enmEclipseErrorMessages.MSG_CANNOT_ADD_XML_LOG_ENTRY, "LogXML - ERROR " + e.Message, e);
+            }
+        }
+
+        /// <summary>
+        /// Log the XML from a GetEclipseServerData call
+        /// </summary>
+        /// <param name="sDefaultErrorReturn"></param>
+        /// <param name="sInputXmlRequest"></param>
+        /// <param name="sReturnXML"></param>
+        /// <param name="dataSet"></param>
+        /// <param name="sUserId"></param>
+        /// <param name="sGUID"></param>
+        /// <param name="lResponseTime"></param>
+        /// <param name="sCategory"></param>
+        /// <param name="sType"></param>
+        /// <param name="ex"></param>
+        private long LogXMLRequest(string sDefaultErrorReturn, string sInputXmlRequest,
+            string sReturnXML, IEclipseDataSet dataSet, string sUserId, string sGUID,
+            int lResponseTime, string sCategory, string sType, ref EclipseException ex)
+        {
+            XmlDocument oDOM;
+            string sRecordsetXML = string.Empty;
+
+            if (SkipLoggingTransactionRequest(sType))
+            {
+                return 0;
+            }
+
+            if (m_enmXMLLogSetting < ECIUtility.enmXMLLogSetting.enmXMLLoggingAll)
+            {
+                return 0;
+            }
+
+            try
+            {
+                if (string.IsNullOrEmpty(sUserId))
+                {
+                    oDOM = new XmlDocument();
+                    try
+                    {
+                        oDOM.LoadXml(sInputXmlRequest);
+                    }
+                    catch
+                    {
+                        throw new EclipseException(enmEclipseErrorMessages.MSG_ECLIPSE_INTERFACE_ERROR, " LogXMLRequest, Invalid XML format");
+                    }
+
+                    //Extract the user id
+                    sUserId = oDOM.SelectSingleNode(string.Format("{0}/{1}/{2}",
+                        XmlConstants.GetXMLTagName(XmlConstants.Txn),
+                        XmlConstants.GetXMLTagName(XmlConstants.Header),
+                        XmlConstants.GetXMLTagName(XmlConstants.TxnUserId))).InnerText;
+                }
+
+                if (m_enmXMLLogSetting > ECIUtility.enmXMLLogSetting.enmXMLLoggingTxAndRxWithoutDataWithErrors)
+                {
+                    if (dataSet != null)
+                    {
+                        MemoryStream writer = new MemoryStream();
+                        DataContractSerializer ser = new DataContractSerializer(
+                            dataSet.GetType(), null, 214748, true, false, null,
+                            new CustomServerContractResolver());
+
+                        ser.WriteObject(writer, dataSet);
+                        writer.Seek(0, SeekOrigin.Begin);
+
+                        int len = (int)writer.Length; //This is a safe conversion since it's only for xml logging.  MaxInt bytes is nearly 2Gig so we should never return this much data.
+                        byte[] data = new byte[writer.Length];
+                        int count = writer.Read(data, 0, len);
+
+                        ASCIIEncoding uniEncoding = new ASCIIEncoding();
+                        char[] charArray = new char[uniEncoding.GetCharCount(data, 0, count)];
+                        uniEncoding.GetDecoder().GetChars(data, 0, count, charArray, 0);
+                        sRecordsetXML = new string(charArray);
+
+                        writer.Close();
+                    }
+                    if (string.IsNullOrEmpty(sRecordsetXML))
+                    {
+                        sRecordsetXML = "<XML>No recordset data was returned by the server</XML>";
+                    }
+                }
+                else
+                {
+                    sRecordsetXML = "";
+                }
+
+                return LogXML(sInputXmlRequest, sReturnXML, sDefaultErrorReturn, sUserId, sRecordsetXML, sGUID, lResponseTime, sCategory, sType);
+            }
+            catch (Exception e)
+            {
+                Trace("LogXMLRequest - ERROR ", e.Message);
+                if ((m_enmXMLLogSetting ==
+                    ECIUtility.enmXMLLogSetting.enmXMLLoggingAllWithErrors) ||
+                    (m_enmXMLLogSetting == ECIUtility.enmXMLLogSetting.enmXMLLoggingTransactionsOnlyWithErrors) ||
+                    (m_enmXMLLogSetting == ECIUtility.enmXMLLogSetting.enmXMLLoggingTxAndRxWithoutDataWithErrors))
+                {
+                    ex = ex == null
+                        ? new EclipseException(enmEclipseErrorMessages.MSG_ECLIPSE_INTERFACE_ERROR, "LogXMLRequest - ERROR ", e)
+                        : EclipseException.AddException(ex, e);
+                }
+            }
+
+            return 0;
+        }
+
+        private bool SkipLoggingTransactionRequest(string sType)
+        {
+            if (string.IsNullOrEmpty(_nonLoggingTransactions)) return false;
+
+            string[] transactionNames = _nonLoggingTransactions.Split(',');
+            return transactionNames.Any(transactionName => transactionName.Equals(sType));
+        }
+
+        /// <summary>
+        /// Log the XML from a ExecuteServerTransaction call
+        /// </summary>
+        /// <param name="sCategory"></param>
+        /// <param name="sType"></param>
+        /// <param name="sDefaultErrorReturn"></param>
+        /// <param name="sInputXmlRequest"></param>
+        /// <param name="sReplyXML"></param>
+        /// <param name="sUserId"></param>
+        /// <param name="sGUID"></param>
+        /// <param name="lResponseTime"></param>
+        /// <param name="ex"></param>
+        private long LogXMLTransaction(string sCategory, string sType,
+            string sDefaultErrorReturn, string sInputXmlRequest, string sReplyXML,
+            string sUserId, string sGUID, int lResponseTime, ref EclipseException ex)
+        {
+            try
+            {
+                if (m_enmXMLLogSetting == ECIUtility.enmXMLLogSetting.enmXMLLoggingNone)
+                {
+                    return 0;
+                }
+
+                return LogXML(sInputXmlRequest, sReplyXML, sDefaultErrorReturn, sUserId, "",
+                    sGUID, lResponseTime, sCategory, sType);
+            }
+            catch (Exception e)
+            {
+                Trace("LogXMLRequest - ERROR ", e.Message);
+                if ((m_enmXMLLogSetting == ECIUtility.enmXMLLogSetting.enmXMLLoggingAllWithErrors)
+                    || (m_enmXMLLogSetting == ECIUtility.enmXMLLogSetting.enmXMLLoggingTransactionsOnlyWithErrors)
+                    || (m_enmXMLLogSetting == ECIUtility.enmXMLLogSetting.enmXMLLoggingTxAndRxWithoutDataWithErrors))
+                {
+                    ex = ex == null
+                        ? new EclipseException(enmEclipseErrorMessages.MSG_ECLIPSE_INTERFACE_ERROR, "LogXMLTransaction - ERROR ", e)
+                        : EclipseException.AddException(ex, e);
+                }
+            }
+
+            return 0;
+        }
+
+        private long LogXMLTransaction(RequestMessage requestMessage,
+            ResponseMessage responseMessage, bool logDataSet)
+        {
+            EclipseException ex = null;
+            string xmlError = responseMessage.EclipseFault != null
+               ? responseMessage.EclipseFault.Xml : string.Empty;
+
+            if (logDataSet)
+            {
+                return LogXMLRequest(
+                    xmlError,
+                    requestMessage.RequestXml,
+                    responseMessage.ResponseXml,
+                    responseMessage.EclipseDataSet,
+                    requestMessage.MessageHeader.UserId,
+                    requestMessage.MessageHeader.Guid,
+                    responseMessage.ResponseTime,
+                    requestMessage.MessageHeader.TransactionCategory,
+                    requestMessage.MessageHeader.TransactionType,
+                    ref ex);
+            }
+
+            return LogXMLTransaction(
+                    requestMessage.MessageHeader.TransactionCategory,
+                    requestMessage.MessageHeader.TransactionType,
+                    xmlError,
+                    requestMessage.RequestXml,
+                    responseMessage.ResponseXml,
+                    requestMessage.MessageHeader.UserId,
+                    requestMessage.MessageHeader.Guid,
+                    responseMessage.ResponseTime,
+                    ref ex);
+
+        }
+
+        /// <summary>
+        /// Stores the given value in the Shared Property Manager.
+        /// </summary>
+        /// <param name="szProperty"></param>
+        /// <param name="szValue"></param>
+        private void SetGlobalData(string szProperty, Object szValue)
+        {
+            try
+            {
+                SharedProperty spmProp = GetSharedProperty(szProperty);
+                spmProp.Value = szValue;
+            }
+            catch (Exception e)
+            {
+                TraceError("EclipseCommonInterface Interface - SetGlobalData", e.Message);
+            }
+        }
+
+        private void VerifiyLicenseAgreement(string sGUID)
+        {
+            string sReply = string.Empty;
+
+            Trace("VerifiyLicenseAgreement", (String.CompareOrdinal(sGUID, "") > 0) ? "Using GUID" + sGUID : "No GUID supplied");
+
+            //TODO: Should this not be via an EclipseCommonInterface call?? SvrLicensing.Licensing oLicense = new SvrLicensing.Licensing();
+            //UPGRADE_TODO: (1067) Member VerifyLicensing is not defined in type Interface. More Information: http://www.vbtonet.com/ewis/ewi1067.aspx
+            CSvrLicensing oLicense = new CSvrLicensing();
+            oLicense.VerifyLicensing(string.Empty, ref sReply, sGUID);
+
+            if (!Int32.TryParse(sReply, out iValidationFrequency))
+            {
+                iValidationFrequency = 0;
+            }
+
+            //iValidationFrequency = Int32.Parse(sReply);
+
+            Trace("VerifiyLicenseAgreement", "Verified");
+        }
+
+        /// <summary>
+        /// Dynmaically create an instance of the given object
+        /// </summary>
+        /// <param name="component">The component name (needed if we are not using a ClassFactory)</param>
+        /// <param name="type">The type of the class to create</param>
+        /// <param name="sAssemblyPath">The location of the Assembly (needed if we are not using a ClassFactory)</param>
+        /// <param name="sNamespace">The namespace for the Type we are creating (needed if we are not using a ClassFactory)</param>
+        /// <param name="bUseClassFactory">If True, uses the ClassFactory to create the object.  This should be done wherever possible.</param>
+        /// <returns></returns>
+        public object CreateObject(string component, string type, string sAssemblyPath,
+            string sNamespace, bool bUseClassFactory)
+        {
+            object cls = null;
+
+            if (!bUseClassFactory)
+            {
+                string sPath = sAssemblyPath.Replace("[component]", component);
+                Assembly assembly = Assembly.LoadFrom(sPath + "\\" + component + ".dll");
+                cls = assembly.CreateInstance(sNamespace + "." + type, true);
+            }
+            else
+            {
+                Type cfType = typeof(ServerClassFactory);
+                PropertyInfo methodInfo = cfType.GetProperty("Create" + type, BindingFlags.Static | BindingFlags.Public);
+                if (methodInfo != null) cls = methodInfo.GetValue(null, null);
+            }
+
+            if (cls == null) throw new EclipseCommonInterfaceException(
+                string.Format("Failed to create instance of type {0}.{1} on component {2}{3}ClassFactory",
+                sNamespace, type, component, (bUseClassFactory ? ". Using " : ". Not using ")));
+            return cls;
+        }
+
+        /// <summary>
+        /// Invoke the given method on the target object.
+        /// </summary>
+        /// <param name="target"></param>
+        /// <param name="method"></param>
+        /// <param name="paramTypes"></param>
+        /// <param name="parameters"></param>
+        /// <returns></returns>
+        public string Invoke(object target, string method, Type[] paramTypes, object[] parameters)
+        {
+            Type type = target.GetType();
+            MethodInfo methodInfo = type.GetMethod(method, paramTypes);
+
+            return methodInfo.Invoke(target, parameters) as string;
+        }
+
+        /// <summary>
+        /// Get Load Blacing status of all servers
+        /// </summary>
+        /// <returns></returns>
+        public string GetServerLoadBalancingStats(ref string status)
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                ELBSharedStats temp;
+                for (int index = 0; index < elbStatistics.Length; index++)
+                {
+                    temp = elbStatistics[index];
+                    sb.AppendFormat("{0},{1},{2},{3},{4},{5},{6},{7};",
+                        temp.sServerName, temp.lTotalTime, temp.lTotalCalls,
+                        temp.lLastResponseTime, temp.address, temp.BindingName,
+                        temp.BindingConfig, temp.BehaviorConfig);
+                }
+                status = sb.ToString();
+
+                return string.Empty;
+            }
+            catch (Exception e)
+            {
+                return EclipseException.HandleECICallException(e);
+            }
+        }
+
+        /// <summary>
+        /// Set an ELB server to active
+        /// </summary>
+        /// <param name="iServerIndex"></param>
+        /// <param name="bActive"></param>
+        public string SetELBServerStatus(int iServerIndex, bool bActive)
+        {
+            elbStatistics[iServerIndex].bActive = bActive;
+            return string.Empty;
+        }
+
+        public string SetELBServers(string sServerList)
+        {
+            try
+            {
+                Trace("Change Servers", "Start");
+
+                System.Configuration.Configuration config = ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
+                ConfigurationSectionGroup grop = config.GetSectionGroup("system.serviceModel");
+                if (grop != null)
+                {
+                    ClientSection section = grop.Sections["client"] as ClientSection;
+                    if (section == null)
+                    {
+                        throw new ConfigurationErrorsException("The <system.serviceModel> section is not defined in your .config file!");
+                    }
+
+                    section.Endpoints.Clear();
+                    string[] configs;
+                    ChannelEndpointElement endPoint;
+                    foreach (string serverConfig in sServerList.Split(new char[] { ';' }))
+                    {
+                        configs = serverConfig.Split(new char[] { ',' });
+                        if (configs.Length < 3)
+                        {
+                            throw new Exception("The format for server is wrong!");
+                        }
+                        endPoint = new ChannelEndpointElement();
+                        endPoint.Name = configs[0].IndexOf("(Balancing Server)") < 0 ? configs[0] : "Self";
+                        endPoint.Address = new Uri(configs[1]);
+                        endPoint.Binding = configs[2];
+                        endPoint.BindingConfiguration = configs[3];
+                        endPoint.BehaviorConfiguration = configs[4];
+                        endPoint.Contract = "Percana.Eclipse.Transport.ECI.ISvrECI";
+                        section.Endpoints.Add(endPoint);
+                    }
+
+                    section.CurrentConfiguration.Save(ConfigurationSaveMode.Full);
+                }
+
+                SharedPropertyGroup spmGroup = null;
+
+                bool bGroupExists = false;
+                bool bPropExists = false;
+                SharedProperty spmProp = GetSharedProperty("ServerList", out bGroupExists,
+                    out bPropExists, ref spmGroup);
+                spmProp.Value = SetELBServers(ref spmGroup);
+
+                return string.Empty;
+            }
+            catch (Exception e)
+            {
+                return EclipseException.HandleECICallException(e);
+            }
+        }
+
+        public override ResponseMessage ExecuteServerTransactionRequest(RequestMessage request)
+        {
+            ResponseMessage response = new ResponseMessage();
+            LookupData lookupData = new LookupData();
+
+            try
+            {
+                // If _isClientCall = true, then we have a call made directly from the client to the server 
+                // so need to figure out which server to route the call to
+                if (_isClientCall)
+                {
+                    _isClientCall = false;
+                    TransactionType = ECIUtility.enmTransactionType.Execute;
+                    response = MakeServerCall(request, default(ECIUtility.enmReturnType));
+                }
+                else
+                {
+                    //set thread's culture
+                    CultureInfo orginalCulture = Thread.CurrentThread.CurrentCulture;
+                    CultureInfo orginalUICulture = Thread.CurrentThread.CurrentUICulture;
+
+                    CultureInfo targetCulture = new CultureInfo(
+                        request.MessageHeader.LanguageId);
+                    Thread.CurrentThread.CurrentCulture = targetCulture;
+                    Thread.CurrentThread.CurrentUICulture = targetCulture;
+
+                    Stopwatch timer = new Stopwatch();
+                    timer.Start();
+
+                    //Get the component details from the XML Lookup tables
+                    lookupData = GetComponentDetailsFromXMLLookup(
+                        request.MessageHeader.TransactionCategory,
+                        request.MessageHeader.TransactionType,
+                        request.MessageHeader.Guid);
+
+                    //Use the data returned to create the appropriate component
+                    object oSeverObj = CreateObject(lookupData.sComponent,
+                        lookupData.sClass, ECIConfigSettings.AssemblyPath,
+                        ECIConfigSettings.AssemblyNameSpace, bUseClassFactory);
+
+                    Trace("ExecuteServerTransaction Calling", Convert.ToString(lookupData.sMethod));
+
+                    object[] parameters = new object[]
+                                              {
+                                                  request.RequestXml,
+                                                  response.ResponseXml,
+                                                  request.MessageHeader.Guid,
+                                                  request.MessageHeader.LanguageId
+                                              };
+                    string errorXml = Invoke(oSeverObj, lookupData.sMethod,
+                        new[] { typeof(string), typeof(String).MakeByRefType(), 
+                            typeof(string), typeof(int) },
+                         parameters);
+
+                    if (parameters[1] != null)
+                    {
+                        response.ResponseXml = (string)parameters[1];
+                    }
+
+                    timer.Stop();
+
+                    response.ResponseTime = (int)timer.ElapsedMilliseconds;
+                    //set thread's culture back
+                    Thread.CurrentThread.CurrentCulture = orginalCulture;
+                    Thread.CurrentThread.CurrentUICulture = orginalUICulture;
+
+                    if (!string.IsNullOrEmpty(errorXml))
+                    {
+                        Trace("ExecuteServerTransaction",
+                            string.Format("Error calling {0}.{1}.{2}.{3}. Call took {4}ms.",
+                            lookupData.sComponent,
+                            lookupData.sClass,
+                            lookupData.sMethod,
+                            errorXml, timer.ElapsedMilliseconds));
+
+                        EclipseException eex = GetEclipseException(errorXml);
+                        EclipseFaultSeverity severity = GetErrorSeverity(eex);
+                        if (severity == EclipseFaultSeverity.Error)
+                        {
+                            throw GetFaultContractException(eex, "Server error");
+                        }
+
+                        response.EclipseFault = GetEclipseFaultContract(eex);
+                    }
+
+                    Trace("ExecuteServerTransaction",
+                        string.Format("Local call to {0}.{1}.{2} took {3}ms.",
+                        lookupData.sComponent,
+                        lookupData.sClass,
+                        lookupData.sMethod,
+                        timer.ElapsedMilliseconds));
+                }
+            }
+            catch (FaultException<EclipseFaultContract> ex)
+            {
+                //this is here so if we get an exception, it can be looged/debugged to see what is going on
+                Trace("ExecuteServerTransactionRequest - ERROR ", ex.Message + "; " + ex.StackTrace);
+                throw;
+            }
+            catch (Exception e)
+            {
+                Trace("ExecuteServerTransaction fail", e.Message);
+                throw new FaultException<EclipseFaultContract>(new EclipseFaultContract
+                    {
+                        Message = e.Message,
+                        ErrorNumber = (int)enmEclipseErrorMessages.MSG_PROGRAM_ERROR
+                    }, new FaultReason("Error occured while processing the server"));
+            }
+            finally
+            {
+                if (!_isClientCall)
+                {
+                    response.XmlLogId = LogXMLTransaction(request, response, false);
+                    if (response.XmlLogId != 0)
+                    {
+                        Trace("XML LOG", "xml_log_id = " + response.XmlLogId);
+                    }
+                }
+                else
+                {
+                    if (string.IsNullOrEmpty(lookupData.sXMLHeader))
+                    {
+                        Trace("ExecuteServerTransaction did not call ",
+                            string.Format("{0} {1} successfully",
+                            request.MessageHeader.TransactionCategory,
+                            request.MessageHeader.TransactionType));
+                    }
+                }
+            }
+
+            return response;
+        }
+
+        public override ResponseMessage GetEclipseServerDataRequest(RequestMessage request,
+            ECIUtility.enmReturnType returnType)
+        {
+            ResponseMessage responseMessage = new ResponseMessage();
+            LookupData lookupData = new LookupData();
+
+            //Extract the transaction category and header
+            //This enables us to identify the server component, class and method to call using the XML Lookup tables.
+            try
+            {
+                if (_isClientCall)
+                {
+                    _isClientCall = false;
+                    TransactionType = ECIUtility.enmTransactionType.Get;
+                    return MakeServerCall(request, returnType);
+                }
+
+                //set thread's culture
+                CultureInfo orginalCulture = Thread.CurrentThread.CurrentCulture;
+                CultureInfo orginalUICulture = Thread.CurrentThread.CurrentUICulture;
+
+                CultureInfo targetCulture = new CultureInfo(
+                    request.MessageHeader.LanguageId);
+                Thread.CurrentThread.CurrentCulture = targetCulture;
+                Thread.CurrentThread.CurrentUICulture = targetCulture;
+
+                Stopwatch timer = new Stopwatch();
+                timer.Start();
+
+                //Get the component details from the XML Lookup tables
+                lookupData = GetComponentDetailsFromXMLLookup(
+                    request.MessageHeader.TransactionCategory,
+                    request.MessageHeader.TransactionType,
+                    request.MessageHeader.Guid);
+
+                //Use the data returned to create the appropriate component
+                object oSeverObj = CreateObject(lookupData.sComponent, lookupData.sClass,
+                    ECIConfigSettings.AssemblyPath, ECIConfigSettings.AssemblyNameSpace, bUseClassFactory);
+
+                Trace("GetEclipseServerData Calling ",
+                    Convert.ToString(lookupData.sMethod));
+
+                object[] parameters = new object[] 
+                                            { 
+                                                responseMessage.EclipseDataSet, 
+                                                request.RequestXml, 
+                                                request.MessageHeader.Guid, 
+                                                request.MessageHeader.LanguageId, 
+                                                responseMessage.ResponseXml 
+                                            };
+                string errorXML = Invoke(oSeverObj, lookupData.sMethod,
+                    new[] { typeof(Data.Server.EclipseDataSet).MakeByRefType(), 
+                        typeof(string), typeof(string), typeof(int), 
+                        typeof(string).MakeByRefType() }, parameters);
+
+                if (parameters[0] != null)
+                {
+                    responseMessage.EclipseDataSet =
+                        parameters[0] as Data.Server.EclipseDataSet;
+                }
+
+                if (parameters[4] != null)
+                    responseMessage.ResponseXml = (string)parameters[4];
+
+                timer.Stop();
+
+                //set thread's culture back
+                Thread.CurrentThread.CurrentCulture = orginalCulture;
+                Thread.CurrentThread.CurrentUICulture = orginalUICulture;
+
+                if (!string.IsNullOrEmpty(errorXML))
+                {
+                    Trace("GetEclipseServerData",
+                        string.Format("Error calling {0}.{1}.{2}.{3}. Call took {4}ms.",
+                        lookupData.sComponent,
+                        lookupData.sClass,
+                        lookupData.sMethod,
+                        errorXML,
+                        timer.ElapsedMilliseconds));
+
+                    EclipseException eex = GetEclipseException(errorXML);
+                    EclipseFaultSeverity severity = GetErrorSeverity(eex);
+                    if (severity == EclipseFaultSeverity.Error)
+                    {
+                        throw GetFaultContractException(eex, "Server error");
+                    }
+
+                    responseMessage.EclipseFault = GetEclipseFaultContract(eex);
+                }
+
+                Trace("GetEclipseServerData",
+                    string.Format("Local call to {0}.{1}.{2} took {3}ms.",
+                    lookupData.sComponent,
+                    lookupData.sClass,
+                    lookupData.sMethod,
+                    timer.ElapsedMilliseconds));
+            }
+            catch (FaultException<EclipseFaultContract>)
+            {
+                throw;
+            }
+            catch (Exception e)
+            {
+                throw new FaultException<EclipseFaultContract>(new EclipseFaultContract()
+                {
+                    Message = "GetEclipseServerData fail because " + e.Message,
+                    ErrorNumber = (int)enmEclipseErrorMessages.MSG_ECLIPSE_INTERFACE_ERROR
+                }, new FaultReason("Error occured while processing the request on the server"));
+            }
+            finally
+            {
+                if (!_isClientCall)
+                {
+                    responseMessage.XmlLogId = LogXMLTransaction(request, responseMessage, true);
+                    if (responseMessage.XmlLogId != 0)
+                    {
+                        Trace("XML LOG", "xml_log_id = " + responseMessage.XmlLogId);
+                    }
+                }
+                else
+                {
+                    if (string.IsNullOrEmpty(lookupData.sXMLHeader))
+                    {
+                        Trace("GetEclipseServerData did not call ",
+                            string.Format("{0} {1} successfully",
+                            request.MessageHeader.TransactionType,
+                            request.MessageHeader.TransactionCategory));
+                    }
+                }
+            }
+
+            return responseMessage;
+        }
+
+        private static FaultException<EclipseFaultContract> GetFaultContractException(
+            EclipseException eclipseException, string reason = "")
+        {
+            return new FaultException<EclipseFaultContract>(
+                GetEclipseFaultContract(eclipseException), new FaultReason(reason));
+        }
+
+        private static EclipseFaultContract GetEclipseFaultContract(
+            EclipseException eclipseException)
+        {
+            return new EclipseFaultContract
+                       {
+                           Message = eclipseException.Message,
+                           MessageAndInnerMessages = eclipseException.MessageAndInnerMessages,
+                           ErrorNumber = (int)eclipseException.ErrorNumber,
+                           WarningNumber = (int)eclipseException.WarningNumber,
+                           InformationNumber = (int)eclipseException.InformationNumber,
+                           Xml = eclipseException.AsXmlString(),
+                       };
+
+        }
+
+        private static EclipseException GetEclipseException(string errorXml)
+        {
+            return (string.IsNullOrEmpty(errorXml))
+                ? null : EclipseException.CreateFromXmlString(errorXml);
+        }
+
+        private static EclipseFaultSeverity GetErrorSeverity(EclipseException exception)
+        {
+            if (exception == null)
+                throw new ArgumentNullException("exception");
+
+            if (exception.ErrorsRaised)
+                return EclipseFaultSeverity.Error;
+
+            if (exception.InformationMessageRaised)
+                return EclipseFaultSeverity.Information;
+
+            if (exception.WarningsRaised)
+                return EclipseFaultSeverity.Warning;
+
+            return default(EclipseFaultSeverity);
+        }
+
+        #endregion Methods
+    }
+}
